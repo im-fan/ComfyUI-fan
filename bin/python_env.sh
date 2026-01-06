@@ -1,7 +1,8 @@
 # init python env
 conda create --name comfyui
 conda activate comfyui
-
+conda init zsh
+conda activate comfyui
 #清理不再需要的包
 #conda clean --all
 
