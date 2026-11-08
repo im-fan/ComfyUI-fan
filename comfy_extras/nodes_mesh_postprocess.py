@@ -7,7 +7,7 @@ import copy
 import comfy.utils
 import comfy.model_management
 from server import PromptServer
-from comfy_extras.mesh3d.postprocess.qem_decimate import QEMConfig, qem_decimate_simplify, qem_cluster_decimate, _compute_vertex_normals
+from comfy_extras.mesh3d.postprocess.qem_decimate import QEMConfig, qem_simplify, qem_cluster_decimate, _compute_vertex_normals, _connected_labels
 from comfy_extras.mesh3d.postprocess.remesh import remesh_narrow_band_dc, _point_tri_closest
 from comfy_extras.nodes_save_3d import get_mesh_batch_item, pack_variable_mesh_batch
 from comfy_extras.mesh3d.uv_unwrap import mesh as _uv_mesh
@@ -21,6 +21,21 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 import scipy.ndimage as ndi
+
+
+def _mesh_face_count(mesh):
+    if mesh.face_counts is not None:
+        return sum(int(count) for count in mesh.face_counts)
+    if isinstance(mesh.faces, list):
+        return sum(int(faces.shape[0]) for faces in mesh.faces)
+    return int(mesh.faces.numel() // 3)
+
+
+def _prepare_gpu_mesh_processing(device, memory_required):
+    comfy.model_management.free_memory(
+        int(memory_required) + comfy.model_management.minimum_inference_memory(),
+        device,
+    )
 
 
 def paint_mesh_with_voxels(mesh, voxel_coords, voxel_colors, resolution):
@@ -215,6 +230,7 @@ def _bake_position_map(verts_np, faces_np, uvs_np, texture_size):
     verts = torch.from_numpy(np.ascontiguousarray(verts_np, dtype=np.float32)).to(dev)
     faces = torch.from_numpy(np.ascontiguousarray(faces_np).astype(np.int64)).to(dev)
     attr = _interp_vertex_attr(verts, faces, face_idx, bary, mask)
+    del face_idx, bary, verts, faces
     return attr.cpu().numpy(), mask.cpu().numpy()
 
 
@@ -270,14 +286,15 @@ def _trilinear_sample_sparse_gpu(positions, voxel_coords_np, color_np, resolutio
     R = int(resolution)
     origin = -0.5
     voxel_size = 1.0 / R
+    index_dtype = torch.int32 if R ** 3 <= torch.iinfo(torch.int32).max else torch.int64
     P = torch.from_numpy(np.ascontiguousarray(positions)).to(dev).float()
-    VC = torch.from_numpy(np.ascontiguousarray(voxel_coords_np)).to(dev).long()
+    VC = torch.from_numpy(np.ascontiguousarray(voxel_coords_np)).to(device=dev, dtype=index_dtype)
     col = torch.from_numpy(np.ascontiguousarray(color_np)).to(dev).float()
     K, C = P.shape[0], col.shape[1]
     M = VC.shape[0]
     # Cell-CENTER convention (see NumPy path): -0.5 to bracket the query.
     gc = (P - origin) / voxel_size - 0.5
-    base = torch.floor(gc).long()
+    base = torch.floor(gc).to(index_dtype)
     frac = gc - base.float()
     key = (VC[:, 0] * R + VC[:, 1]) * R + VC[:, 2]
     skey, order = key.sort()
@@ -298,7 +315,9 @@ def _trilinear_sample_sparse_gpu(positions, voxel_coords_np, color_np, resolutio
                 matched = inb & (skey[ins] == qk)
                 idx = order[ins]                              # garbage where !matched
                 w = torch.where(matched, wx * wy * wz, torch.zeros_like(wx))[:, None]
-                acc += w * col[idx]                           # w=0 cancels garbage rows
+                weighted = col[idx]
+                weighted.mul_(w)                              # w=0 cancels garbage rows
+                acc.add_(weighted)
                 wsum += w
     ok = wsum[:, 0] > 1e-8
     vals = torch.zeros((K, C), device=dev)
@@ -316,8 +335,9 @@ def _nearest_voxel_sample_gpu(positions, voxel_coords_np, color_np, resolution):
     float32, found [K] bool); `found` is False for stragglers left to the caller's cKDTree."""
     dev = comfy.model_management.get_torch_device()
     R = int(resolution)
+    index_dtype = torch.int32 if R ** 3 <= torch.iinfo(torch.int32).max else torch.int64
     P = torch.from_numpy(np.ascontiguousarray(positions)).to(dev).float()
-    VC = torch.from_numpy(np.ascontiguousarray(voxel_coords_np)).to(dev).long()
+    VC = torch.from_numpy(np.ascontiguousarray(voxel_coords_np)).to(device=dev, dtype=index_dtype)
     col = torch.from_numpy(np.ascontiguousarray(color_np)).to(dev).float()
     M, K = VC.shape[0], P.shape[0]
     key = (VC[:, 0] * R + VC[:, 1]) * R + VC[:, 2]
@@ -327,7 +347,7 @@ def _nearest_voxel_sample_gpu(positions, voxel_coords_np, color_np, resolution):
         """Nearest occupied voxel within ±radius cells, for query subset P[idx]."""
         Ps = P[idx]
         # Cell-CENTER convention: nearest coord = round((p+0.5)*R-0.5) (matches official).
-        rc = ((Ps + 0.5) * R - 0.5).round().long()
+        rc = ((Ps + 0.5) * R - 0.5).round().to(index_dtype)
         n = idx.shape[0]
         bd = torch.full((n,), 1e30, device=dev)
         bi = torch.zeros(n, dtype=torch.long, device=dev)
@@ -336,7 +356,7 @@ def _nearest_voxel_sample_gpu(positions, voxel_coords_np, color_np, resolution):
         for dx in rng:
             for dy in rng:
                 for dz in rng:
-                    cc = rc + torch.tensor([dx, dy, dz], device=dev)
+                    cc = rc + torch.tensor([dx, dy, dz], dtype=index_dtype, device=dev)
                     inb = ((cc >= 0) & (cc < R)).all(1)
                     qk = (cc[:, 0] * R + cc[:, 1]) * R + cc[:, 2]
                     ins = torch.searchsorted(skey, qk).clamp(max=M - 1)
@@ -401,12 +421,7 @@ def _sample_voxel_attrs_per_texel(position_map, mask, voxel_coords, voxel_colors
     if not mask.any():
         return out
 
-    origin = np.array([-0.5, -0.5, -0.5], dtype=np.float32)
-    voxel_size = 1.0 / float(resolution)
     coords_np = voxel_coords.detach().cpu().numpy()
-    # Cell-CENTER convention (+0.5 voxel) — same world mapping as the sampling paths; these
-    # voxel centres serve the rare cKDTree nearest fallback below.
-    voxel_pos = (coords_np.astype(np.float32) + 0.5) * voxel_size + origin
     valid_positions = position_map[mask]
 
     def _nearest(query):
@@ -415,6 +430,9 @@ def _sample_voxel_attrs_per_texel(position_map, mask, voxel_coords, voxel_colors
         # those with one cKDTree, since GPU brute force is O(N·M) and blows up at large N.
         vals, found = _nearest_voxel_sample_gpu(query, coords_np, color_np, resolution)
         if not found.all():
+            origin = np.array([-0.5, -0.5, -0.5], dtype=np.float32)
+            voxel_size = 1.0 / float(resolution)
+            voxel_pos = (coords_np.astype(np.float32) + 0.5) * voxel_size + origin
             tree = cKDTree(voxel_pos)
             _, nearest_idx = tree.query(query[~found], k=1, workers=-1)
             vals[~found] = color_np[nearest_idx]
@@ -428,7 +446,8 @@ def _sample_voxel_attrs_per_texel(position_map, mask, voxel_coords, voxel_colors
         vals, ok = _trilinear_sample_sparse(valid_positions, coords_np, color_np, resolution)
     if not ok.all():
         vals[~ok] = _nearest(valid_positions[~ok])  # no occupied neighbour
-    out[mask] = np.clip(vals, 0.0, 1.0).astype(np.float32)
+    np.clip(vals, 0.0, 1.0, out=vals)
+    out[mask] = vals
     return out
 
 
@@ -470,8 +489,9 @@ def _build_triangle_bvh(tri):
     span = (hi - lo).clamp_min(1e-12)
     q = (((cent - lo) / span).clamp(0, 1) * float((1 << 21) - 1)).long()
     morton = (_morton_expand21(q[:, 0]) << 2 | _morton_expand21(q[:, 1]) << 1 | _morton_expand21(q[:, 2])).long()
-    order = torch.argsort(morton)
-    msort = morton[order]
+    order_long = torch.argsort(morton)
+    msort = morton[order_long]
+    order = order_long.to(torch.int32)
 
     # delta(i,j): common-prefix length of (morton, index) keys of leaves i,j (index
     # breaks ties so duplicate codes still split); -1 if OOB.
@@ -485,7 +505,7 @@ def _build_triangle_bvh(tri):
         cpi = torch.where(xi == 0, torch.full_like(x, 32), 31 - _msb_int64(xi.clamp_min(1)))
         return torch.where(ok, cp + torch.where(same, cpi, torch.zeros_like(cp)), torch.full_like(x, -1))
 
-    I = torch.arange(T - 1, device=dev)
+    I = torch.arange(T - 1, dtype=torch.int32, device=dev)
     dplus = delta(I, I + 1)
     dminus = delta(I, I - 1)
     direction = torch.where(dplus >= dminus, torch.ones_like(I), -torch.ones_like(I))
@@ -529,11 +549,18 @@ def _build_triangle_bvh(tri):
     left = torch.where(gamma == first, LEAF + gamma, gamma)
     right = torch.where(gamma + 1 == last, LEAF + gamma + 1, gamma + 1)
 
+    del cent, lo, hi, span, q, morton, order_long
+    del I, dplus, dminus, direction, dmin, lmax, cond, l, t, j
+    del first, last, dnode, s, div, rng, step, cond1, gamma
+    delta = None
+    msort = None
+
     # node AABBs: leaves seeded, internal unioned bottom-up (~log2(T) passes; cap is a backstop).
     nmin = torch.empty((2 * T, 3), device=dev)
     nmax = torch.empty((2 * T, 3), device=dev)
     nmin[LEAF:] = amin[order]
     nmax[LEAF:] = amax[order]
+    del amin, amax
     setm = torch.zeros(2 * T, dtype=torch.bool, device=dev)
     setm[LEAF:] = True
     for _ in range(128):
@@ -563,7 +590,7 @@ def _closest_points_on_mesh_bvh(Q, tri, bvh, max_stack=64, return_face=False):
     left = bvh['left']
     right = bvh['right']
     order = bvh['order']
-    stack = torch.full((N, max_stack), -1, dtype=torch.long, device=dev)
+    stack = torch.full((N, max_stack), -1, dtype=torch.int32, device=dev)
     sp = torch.ones(N, dtype=torch.long, device=dev)
     stack[:, 0] = 0
     best = torch.full((N,), 1e30, device=dev)
@@ -593,7 +620,7 @@ def _closest_points_on_mesh_bvh(Q, tri, bvh, max_stack=64, return_face=False):
             gu = ga[upd]
             best[gu] = d2[upd]
             bestp[gu] = cp[upd]
-            bestf[gu] = fidx[upd]
+            bestf[gu] = fidx[upd].long()
         iv = within & ~isleaf
         if bool(iv.any()):
             gi = a[iv]
@@ -631,20 +658,19 @@ def _back_project_positions(position_map, mask, ref_v, ref_f, max_query_res=1024
 
     dev = comfy.model_management.get_torch_device()
     rv = ref_v.detach().to(dev).float()
-    rf = ref_f.detach().to(dev).long()
+    rf = ref_f.detach().to(device=dev, dtype=torch.int32)
     tri = rv[rf]
     bvh = _build_triangle_bvh(tri)
-
-    def _closest(pts_np):
-        return _closest_points_on_mesh_bvh(
-            torch.from_numpy(np.ascontiguousarray(pts_np.astype(np.float32))).to(dev), tri, bvh
-        ).detach().cpu().numpy().astype(np.float32)
+    del rv, rf
 
     H, W, _ = position_map.shape
     stride = max(1, int(math.ceil(max(H, W) / float(max_query_res))))
     if stride == 1 or not mask[::stride, ::stride].any():
         out = position_map.copy()
-        out[mask] = _closest(position_map[mask]).astype(position_map.dtype)
+        query = torch.from_numpy(np.ascontiguousarray(position_map[mask], dtype=np.float32)).to(dev)
+        closest = _closest_points_on_mesh_bvh(query, tri, bvh).cpu().numpy().astype(position_map.dtype)
+        del query, tri, bvh
+        out[mask] = closest
         return out
 
     # Low-res correction, then bilinear upsample to full resolution.
@@ -652,7 +678,10 @@ def _back_project_positions(position_map, mask, ref_v, ref_f, max_query_res=1024
     mask_lo = mask[::stride, ::stride]
     Hl, Wl = mask_lo.shape
     corr_lo = np.zeros((Hl, Wl, 3), dtype=np.float32)
-    corr_lo[mask_lo] = _closest(pos_lo[mask_lo]) - pos_lo[mask_lo].astype(np.float32)
+    query = torch.from_numpy(np.ascontiguousarray(pos_lo[mask_lo], dtype=np.float32)).to(dev)
+    closest = _closest_points_on_mesh_bvh(query, tri, bvh).cpu().numpy().astype(np.float32)
+    del query, tri, bvh
+    corr_lo[mask_lo] = closest - pos_lo[mask_lo].astype(np.float32)
     inds = ndi.distance_transform_edt(~mask_lo, return_distances=False, return_indices=True)
     corr_lo = corr_lo[tuple(inds)]                                # extrapolate into gutter (nearest)
     corr = torch.nn.functional.interpolate(
@@ -782,7 +811,7 @@ def _closest_hit_rays_bvh(orig, dirs, tri, bvh, tmin=0.0, tmax=1e30, max_stack=6
             upd = h & (t < best_t[ga])
             gu = ga[upd]
             best_t[gu] = t[upd]
-            best_f[gu] = fidx[upd]
+            best_f[gu] = fidx[upd].long()
         iv = within & ~isleaf
         if bool(iv.any()):
             gi = a[iv]
@@ -837,7 +866,7 @@ def _bake_ambient_occlusion(high_v, high_f, low_v_np, low_f_np, low_uv_np, low_n
     Nl = torch.nn.functional.normalize((bsel[:, :, None] * low_n[vtri]).sum(1), dim=-1, eps=1e-6)
 
     hv = high_v.to(dev).float()
-    hf = high_f.to(dev).long()
+    hf = high_f.to(device=dev, dtype=torch.int32)
     tri = hv[hf]
     bvh = _build_triangle_bvh(tri)
     diag = float((hv.amax(0) - hv.amin(0)).norm().clamp_min(1e-6))
@@ -1155,7 +1184,7 @@ def _bake_normal_map(high_v, high_f, high_n, low_v_np, low_f_np, low_uv_np, low_
     Wl = _interp(tangents[:, 3:4])[:, 0]
 
     hv = high_v.to(dev).float()
-    hf = high_f.to(dev).long()
+    hf = high_f.to(device=dev, dtype=torch.int32)
     tri = hv[hf]
     bvh = _build_triangle_bvh(tri)
 
@@ -1209,10 +1238,13 @@ def _jfa_fill_gpu(img01, mask):
     it = torch.from_numpy(np.ascontiguousarray(img01)).to(dev).float()
     mm = torch.from_numpy(np.ascontiguousarray(mask)).to(dev)
     H, W = mm.shape
-    yy, xx = torch.meshgrid(torch.arange(H, device=dev), torch.arange(W, device=dev), indexing="ij")
+    yy, xx = torch.meshgrid(
+        torch.arange(H, dtype=torch.int32, device=dev),
+        torch.arange(W, dtype=torch.int32, device=dev),
+        indexing="ij",
+    )
     by = torch.where(mm, yy, torch.full_like(yy, -1))
     bx = torch.where(mm, xx, torch.full_like(xx, -1))
-    INF = torch.full_like(yy, 1 << 30)
     step = 1 << ((max(H, W) - 1).bit_length() - 1)
     while step >= 1:
         for dy in (-step, 0, step):
@@ -1224,13 +1256,14 @@ def _jfa_fill_gpu(img01, mask):
                 cby = by[ny, nx]
                 cbx = bx[ny, nx]
                 valid = cby >= 0
-                dc = torch.where(valid, (yy - cby) ** 2 + (xx - cbx) ** 2, INF)
-                db = torch.where(by >= 0, (yy - by) ** 2 + (xx - bx) ** 2, INF)
+                dc = torch.where(valid, (yy - cby) ** 2 + (xx - cbx) ** 2, 1 << 30)
+                db = torch.where(by >= 0, (yy - by) ** 2 + (xx - bx) ** 2, 1 << 30)
                 take = valid & (dc < db)
                 by = torch.where(take, cby, by)
                 bx = torch.where(take, cbx, bx)
         step //= 2
-    filled = it[by.clamp(0).long(), bx.clamp(0).long()]
+    flat_idx = by.clamp_min_(0).long().mul_(W).add_(bx.clamp_min_(0))
+    filled = it.reshape(-1, it.shape[-1])[flat_idx.reshape(-1)].reshape(H, W, -1)
     return filled.cpu().numpy()
 
 
@@ -1309,18 +1342,22 @@ def bake_texture_from_voxel_fn(vertices, faces, voxel_coords, voxel_colors,
 
     # PBR layout (upstream pbr_attr_layout): 0:3 base_color, 3 metallic, 4 roughness, 5 alpha.
     C = attrs.shape[-1]
-    base_color = attrs[..., 0:3]
+    base_color = np.ascontiguousarray(attrs[..., 0:3])
     has_pbr = C >= 5
-    metallic = attrs[..., 3:4] if C >= 4 else None
-    roughness = attrs[..., 4:5] if C >= 5 else None
     # alpha (idx 5) ignored — meshes kept opaque (upstream OPAQUE alpha_mode).
 
-    base_color = _seam_fill(np.ascontiguousarray(base_color), mask)
     mr_image = None
     if has_pbr:
         # glTF metallicRoughness: R unused, G=roughness, B=metallic.
-        mr = np.concatenate([np.zeros_like(roughness), roughness, metallic], axis=-1)
-        mr_image = _seam_fill(np.ascontiguousarray(mr), mask)
+        mr = np.empty((*attrs.shape[:-1], 3), dtype=attrs.dtype)
+        mr[..., 0] = 0.0
+        mr[..., 1] = attrs[..., 4]
+        mr[..., 2] = attrs[..., 3]
+    del attrs
+
+    base_color = _seam_fill(base_color, mask)
+    if has_pbr:
+        mr_image = _seam_fill(mr, mask)
 
     device = vertices.device
     out_v = torch.from_numpy(new_verts).to(device=device, dtype=torch.float32)
@@ -1338,9 +1375,9 @@ def _mr_channel(packed_mr, ch, ref):
     """Pull one channel (G=roughness idx 1, B=metallic idx 2) from a packed glTF MR map
     as 3-channel grayscale [H,W,3] in [0,1]. Black sized like `ref` if no MR map."""
     if packed_mr is None:
-        return torch.zeros_like(ref.float().cpu())
-    m = packed_mr.float().clamp(0.0, 1.0).cpu()
-    return m[..., ch:ch + 1].expand(-1, -1, 3).contiguous()
+        return torch.zeros((*ref.shape[:-1], 1), dtype=torch.float32).expand(-1, -1, 3)
+    m = packed_mr[..., ch:ch + 1].float().clamp(0.0, 1.0).cpu()
+    return m.expand(-1, -1, 3)
 
 
 class BakeTextureFromVoxel(IO.ComfyNode):
@@ -1375,6 +1412,9 @@ class BakeTextureFromVoxel(IO.ComfyNode):
 
     @classmethod
     def execute(cls, mesh, voxel_colors, texture_size, reference_mesh=None):
+        reference_faces = _mesh_face_count(reference_mesh if reference_mesh is not None else mesh)
+        memory_required = max(texture_size * texture_size * 512, reference_faces * 512)
+        _prepare_gpu_mesh_processing(comfy.model_management.get_torch_device(), memory_required)
         voxels = voxel_colors
         coords = voxels.data
         colors = voxels.voxel_colors
@@ -1424,9 +1464,17 @@ class BakeTextureFromVoxel(IO.ComfyNode):
                 black = torch.zeros((1, texture_size, texture_size, 3))
                 return IO.NodeOutput(black, black, black)
             # Stack [B,H,W,3]; split packed MR (G=roughness, B=metallic) into grayscale maps.
-            base_img = torch.stack([t.float().clamp(0.0, 1.0).cpu() for t in out_tex], dim=0)
-            metallic_img = torch.stack([_mr_channel(m, 2, out_tex[0]) for m in out_mr], dim=0)
-            roughness_img = torch.stack([_mr_channel(m, 1, out_tex[0]) for m in out_mr], dim=0)
+            base_maps = [t.float().clamp(0.0, 1.0).cpu() for t in out_tex]
+            metallic_maps = [_mr_channel(m, 2, out_tex[0]) for m in out_mr]
+            roughness_maps = [_mr_channel(m, 1, out_tex[0]) for m in out_mr]
+            if len(base_maps) == 1:
+                base_img = base_maps[0].unsqueeze(0)
+                metallic_img = metallic_maps[0].unsqueeze(0)
+                roughness_img = roughness_maps[0].unsqueeze(0)
+            else:
+                base_img = torch.stack(base_maps, dim=0)
+                metallic_img = torch.stack(metallic_maps, dim=0)
+                roughness_img = torch.stack(roughness_maps, dim=0)
             return IO.NodeOutput(base_img, metallic_img, roughness_img)
 
         # Single-item path.
@@ -1586,7 +1634,7 @@ class ApplyTextureToMesh(IO.ComfyNode):
             def _chan(img, default):
                 if img is None:
                     return torch.full((B, H, W, 1), float(default))
-                t = img.float().clamp(0.0, 1.0).cpu()[..., 0:1]
+                t = img[..., 0:1].float().clamp(0.0, 1.0).cpu()
                 if int(t.shape[1]) != H or int(t.shape[2]) != W:
                     t = torch.nn.functional.interpolate(t.permute(0, 3, 1, 2), size=(H, W),
                                                         mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
@@ -1892,19 +1940,8 @@ def _fill_holes_v2_gpu(verts, faces, max_perimeter, colors=None, fill_chains=Fal
     src = b_directed[:, 0].long()
     tgt = b_directed[:, 1].long()
 
-    # Undirected bidirectional min-prop with path compression.
-    labels = torch.arange(V, dtype=torch.long, device=device)
-    for _ in range(64):
-        edge_min = torch.minimum(labels[src], labels[tgt])
-        new_labels = labels.clone()
-        new_labels.scatter_reduce_(0, src, edge_min, reduce="amin", include_self=True)
-        new_labels.scatter_reduce_(0, tgt, edge_min, reduce="amin", include_self=True)
-        new_labels = new_labels[new_labels]  # path compression
-        if torch.equal(new_labels, labels):
-            break
-        labels = new_labels
-
-    # After bidir-prop, labels[src] == labels[tgt], so labels[src] is the edge's component.
+    labels = _connected_labels(torch.stack([src, tgt], 1), V)
+    # labels[src] == labels[tgt], so labels[src] is the edge's component
     edge_component = labels[src]
     unique_components, component_idx = torch.unique(edge_component, return_inverse=True)
     L = unique_components.shape[0]
@@ -2157,7 +2194,7 @@ def fill_holes_v2_fn(vertices, faces, max_perimeter=0.03, colors=None, weld_epsi
 
 def _process_mesh_batch(mesh, per_item_fn):
     """Dispatch list/batched/single mesh, extract colors, stack results."""
-    mesh = copy.deepcopy(mesh)
+    mesh = copy.copy(mesh)
 
     def process_single(v, f, c, bar):
         v, f, c = per_item_fn(v, f, c)
@@ -2301,7 +2338,7 @@ class DecimateMesh(IO.ComfyNode):
             counts["in"] += int(f.shape[0])
             if target_face_count > 0 and f.shape[0] > target_face_count:
                 src_device = v.device
-                rv, rf, rc, _rn, _rs = qem_decimate_simplify(
+                rv, rf, rc = qem_simplify(
                     v.to(compute_device), f.to(compute_device), int(target_face_count),
                     colors=(c.to(compute_device) if c is not None else None),
                     config=cfg)
@@ -2329,7 +2366,8 @@ class RemeshMesh(IO.ComfyNode):
         sign_mode_options = [
             IO.DynamicCombo.Option(key="udf", inputs=[
                 IO.Boolean.Input("qef", default=False, advanced=True,
-                                 tooltip="QEF (Quadratic Error Function) dual-vertex placement for sharper edges."),
+                                 tooltip="QEF (Quadratic Error Function) vertex placement: sharp edges on hard-surface input, "
+                                         "jagged creases on organic input."),
                 IO.Boolean.Input("drop_inverted_components", default=False, advanced=True,
                                  tooltip="Drop inward-normal (negative-volume) closed components — the UDF inner shell."),
                 IO.Boolean.Input("drop_enclosed_components", default=False, advanced=True,
@@ -2341,6 +2379,14 @@ class RemeshMesh(IO.ComfyNode):
                 IO.Boolean.Input("manifold", default=False,
                                  tooltip="Manifold Dual Contouring: 1-4 dual verts/voxel for multi-sheet cases. Slower."),
             ]),
+            IO.DynamicCombo.Option(key="solid", inputs=[
+                IO.Float.Input("fill", default=20.0, min=0.0, max=1000.0, step=1.0,
+                               tooltip="Cost of closing an opening relative to following the surface. Lower closes "
+                                       "larger openings (0 puts a lid on a cup); higher only closes small holes and cracks."),
+                IO.Boolean.Input("qef", default=False, advanced=True,
+                                 tooltip="QEF (Quadratic Error Function) vertex placement: sharp edges on hard-surface input, "
+                                         "jagged creases on organic input."),
+            ]),
         ]
         return IO.Schema(
             node_id="RemeshMesh",
@@ -2350,7 +2396,8 @@ class RemeshMesh(IO.ComfyNode):
                 "Re-extracts a uniformly tessellated mesh via a narrow-band distance field + Dual "
                 "Contouring, on the active compute device. Normalizes messy / non-manifold / "
                 "self-intersecting topology; run before Decimate Mesh to hit an exact face count. "
-                "Output stays welded."
+                "Output stays welded. Meshes reaching past 0.51 or spanning under 0.5 are fitted to the "
+                "[-0.5,0.5] cube first and mapped back."
             ),
             inputs=[
                 IO.Mesh.Input("mesh"),
@@ -2359,9 +2406,12 @@ class RemeshMesh(IO.ComfyNode):
                                      "For an exact face count, follow with Decimate Mesh."),
                 IO.DynamicCombo.Input("sign_mode", options=sign_mode_options, display_name="sign_mode",
                                       tooltip="udf: robust to messy/non-manifold input. sdf: clean single "
-                                              "surface with QEF (Quadratic Error Function) sharp-feature recovery, but needs consistent winding."),
+                                              "surface with QEF (Quadratic Error Function) sharp-feature recovery, but needs consistent winding. "
+                                              "solid: one watertight solid from messy input: a global inside/outside graph cut "
+                                              "(CelloCut) removes double shells and closes small holes. Slower."),
                 IO.Float.Input("band", default=1.0, min=0.5, max=4.0, step=0.1, advanced=True,
-                               tooltip="Narrow-band width in voxel units. In UDF mode also offsets the surface."),
+                               tooltip="Narrow-band width in voxel units. In udf mode also offsets the surface; in solid mode it is the "
+                                       "closing radius: creases are filleted and gaps bridged at this size, the surface sits half a voxel out."),
                 IO.Float.Input("project_back", default=0.0, min=0.0, max=1.0, step=0.05, advanced=True,
                                tooltip="Linearly interpolate vertices toward the original surface (0 = pure DC, 1 = snapped)."),
                 IO.Boolean.Input("fix_poles", default=False, advanced=True,
@@ -2383,13 +2433,16 @@ class RemeshMesh(IO.ComfyNode):
                 drop_small_components, precluster_max_verts):
         mode = sign_mode.get("sign_mode", "udf")
         # mode-specific sub-widgets (absent → defaults)
-        qef = bool(sign_mode.get("qef", True))
+        qef = bool(sign_mode.get("qef", mode == "sdf"))
         manifold = bool(sign_mode.get("manifold", False))
         drop_inverted_components = bool(sign_mode.get("drop_inverted_components", False))
         drop_enclosed_components = bool(sign_mode.get("drop_enclosed_components", False))
+        fill = float(sign_mode.get("fill", 20.0))
 
         # ComfyUI passes meshes on CPU (remesh far faster on GPU); compute on device, return on original.
         compute_device = comfy.model_management.get_torch_device()
+        memory_required = max(resolution ** 3 * 64, _mesh_face_count(mesh) * 512)
+        _prepare_gpu_mesh_processing(compute_device, memory_required)
         counts = {"in": 0, "out": 0}
 
         def _fn(v, f, c):
@@ -2399,29 +2452,58 @@ class RemeshMesh(IO.ComfyNode):
             ff = f.to(compute_device).to(torch.int64)
             cc = c.to(compute_device).float() if c is not None else None
 
+            # a NaN, inf or float-limit vertex would poison every bound and distance: its faces go, and then every vertex
+            # no face uses, so neither it nor a stray can move the precluster grid or the fit below
+            bad = ~(vv.abs() < 1e38).all(dim=1)
+            if bad.any():
+                ff = ff[~bad[ff].any(dim=1)]
+            used = torch.zeros(vv.shape[0], dtype=torch.bool, device=compute_device)
+            used[ff.reshape(-1)] = True
+            vv, ff, cc = vv[used], (used.cumsum(0) - 1)[ff], cc[used] if cc is not None else None
+
             # cluster-decimate very large inputs before field queries
             if precluster_max_verts > 0 and vv.shape[0] > precluster_max_verts:
                 vv, ff, cc = qem_cluster_decimate(
                     vv, ff, target_verts=int(precluster_max_verts), colors=cc)
 
+            if ff.numel() == 0:  # none to begin with, none finite, or the precluster collapsed them all
+                return vv[:0].to(src_device), ff[:0].to(device=src_device, dtype=torch.int32), cc[:0].to(src_device) if cc is not None else None
+
             # Fixed [-0.5,0.5] cube domain (matches cumesh/TRELLIS2); scale ≈ 1.0 any resolution.
             rs_scale = (resolution + 3.0 * band) / resolution
             rs_center = torch.zeros(3, dtype=vv.dtype, device=compute_device)
+
+            # Generated meshes fill that cube, spilling to ~0.505, and stay as they are; anything else is fitted into it and mapped back
+            lo, hi = vv.min(dim=0)[0], vv.max(dim=0)[0]
+            extent = float((hi - lo).max())
+            reach = float(torch.max(-lo, hi).max())
+            fit = extent > 0 and (reach > 0.51 or extent < 0.5)
+            if fit:
+                mesh_center = 0.5 * (lo + hi)
+                cell = rs_scale / resolution
+                margin = math.ceil(band) + 1  # cells past the extremes: the band shell and a corner beyond it
+                span = (resolution - 2 * margin) * cell
+                vv = (vv - mesh_center) / extent * span
+                # the centre and the extremes land a quarter cell past a corner plane: a flat mesh or box face on a plane has no
+                # crossings in udf and sdf, and mid-cell its symmetric shell leaves the solid cut empty
+                rs_center = rs_center + ((resolution / 2 - 0.25) % 1) * cell
 
             rv, rf, rc = remesh_narrow_band_dc(
                 vv, ff,
                 resolution=int(resolution),
                 band=float(band), project_back=float(project_back),
                 qef=qef, sign_mode=mode,
-                manifold=manifold, fix_poles=bool(fix_poles),
+                manifold=manifold, fill=fill, fix_poles=bool(fix_poles),
                 smooth_iters=int(smooth_iters),
                 drop_small_components=float(drop_small_components),
                 drop_inverted_components=drop_inverted_components,
                 drop_enclosed_components=drop_enclosed_components,
                 scale=rs_scale, center=rs_center, colors=cc)
 
+            if fit:
+                rv = rv / span * extent + mesh_center
             v = rv.to(src_device)
-            f = rf.to(src_device)
+            f = rf.to(device=src_device, dtype=torch.int32)
             c = rc.to(src_device) if rc is not None else None
             counts["out"] += int(f.shape[0])
             return v, f, c
@@ -2696,6 +2778,7 @@ class UnwrapMesh(IO.ComfyNode):
     @classmethod
     def execute(cls, mesh, segmenter, resolution, padding, weld_distance):
         compute_device = comfy.model_management.get_torch_device()
+        _prepare_gpu_mesh_processing(compute_device, _mesh_face_count(mesh) * 14 * 1024)
         seg_device = compute_device if segmenter == "pec" else torch.device("cpu")
 
         is_list = isinstance(mesh.vertices, list)
@@ -2727,7 +2810,7 @@ class UnwrapMesh(IO.ComfyNode):
             uvs[:, 1] = 1.0 - uvs[:, 1]                       # UV y flipped vs trimesh
 
             out_v.append(torch.from_numpy(vnp[vmapping]).to(src_device))
-            out_f.append(torch.from_numpy(indices).to(device=src_device, dtype=torch.long))
+            out_f.append(torch.from_numpy(indices).to(device=src_device, dtype=torch.int32))
             out_uv.append(torch.from_numpy(uvs.astype(np.float32)).to(src_device))
             if ci is not None:
                 cnp = ci.detach().cpu().numpy()

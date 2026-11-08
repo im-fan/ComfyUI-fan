@@ -8,6 +8,7 @@ from io import BytesIO
 import av
 import numpy as np
 import torch
+from av.codec import CodecContext
 from PIL import Image
 
 from comfy.utils import common_upscale
@@ -165,7 +166,8 @@ def _compute_downscale_dims(src_w: int, src_h: int, total_pixels: int) -> tuple[
 def downscale_image_tensor(image: torch.Tensor, total_pixels: int = 1536 * 1024) -> torch.Tensor:
     """Downscale input image tensor to roughly the specified total pixels.
 
-    Output dimensions are even and guaranteed to fit within ``total_pixels``
+    Resized output has even dimensions and always fits within ``total_pixels``;
+    an image that already fits is returned unchanged.
     """
     samples = image.movedim(-1, 1)
     dims = _compute_downscale_dims(samples.shape[3], samples.shape[2], int(total_pixels))
@@ -173,6 +175,23 @@ def downscale_image_tensor(image: torch.Tensor, total_pixels: int = 1536 * 1024)
         return image
     new_w, new_h = dims
     return common_upscale(samples, new_w, new_h, "lanczos", "disabled").movedim(1, -1)
+
+
+def downscale_image_tensor_by_max_sides(
+    image: torch.Tensor, *, max_long_side: int, max_short_side: int
+) -> torch.Tensor:
+    """Downscale input image tensor so the long side is at most max_long_side and the short side at most max_short_side."""
+    samples = image.movedim(-1, 1)
+    height, width = samples.shape[2], samples.shape[3]
+    long_side, short_side = max(width, height), min(width, height)
+    scale_by = min(1.0, max_long_side / long_side, max_short_side / short_side)
+    if scale_by >= 1.0:
+        return image
+    long_new = max(1, math.floor(long_side * scale_by))
+    short_new = max(1, min(long_new, math.ceil(short_side * scale_by)))
+    new_width, new_height = (long_new, short_new) if width >= height else (short_new, long_new)
+    s = common_upscale(samples, new_width, new_height, "lanczos", "disabled")
+    return s.movedim(1, -1)
 
 
 def downscale_image_tensor_by_max_side(image: torch.Tensor, *, max_side: int) -> torch.Tensor:
@@ -570,6 +589,26 @@ def _apply_video_scale(video: Input.Video, scale_dims: tuple[int, int]) -> Input
         if output_container is not None:
             output_container.close()
         raise RuntimeError(f"Failed to resize video: {str(e)}") from e
+
+
+def video_to_images_and_mask(video: Input.Video) -> tuple[Input.Image, Input.Mask]:
+    frames: list[torch.Tensor | None] = []
+    with av.open(video.get_stream_source(), mode="r") as container:
+        stream = container.streams.video[0]
+        decoder = CodecContext.create("libvpx-vp9", "r") if stream.codec_context.name == "vp9" else None
+        for packet in container.demux(stream):
+            for frame in decoder.decode(packet) if decoder is not None else packet.decode():
+                frames.append(torch.from_numpy(frame.to_ndarray(format="rgba")))
+    if not frames:
+        raise ValueError("The video contains no frames.")
+    height, width = frames[0].shape[:2]
+    images = torch.empty((len(frames), height, width, 3))
+    mask = torch.empty((len(frames), height, width))
+    for i, rgba in enumerate(frames):
+        images[i] = rgba[..., :3] / 255.0
+        mask[i] = 1.0 - rgba[..., 3] / 255.0
+        frames[i] = None
+    return images, mask
 
 
 def _f32_pcm(wav: torch.Tensor) -> torch.Tensor:
